@@ -3,7 +3,7 @@ from typing import List
 import schemas
 from chalicelib.core import events, metadata, events_ios, \
     sessions_mobs, issues, projects, errors, resources, assist, performance_event
-from chalicelib.utils import pg_client, helper, metrics_helper
+from chalicelib.utils import pg_client, helper, metrics_helper, ch_client
 
 SESSION_PROJECTION_COLS = """s.project_id,
 s.session_id::text AS session_id,
@@ -27,7 +27,34 @@ favorite_sessions.session_id NOTNULL            AS favorite,
 COALESCE((SELECT TRUE
  FROM public.user_viewed_sessions AS fs
  WHERE s.session_id = fs.session_id
-   AND fs.user_id = %(userId)s LIMIT 1), FALSE) AS viewed """
+   AND fs.user_id = %(userId)s LIMIT 1), FALSE) AS viewed 
+   """
+
+SESSION_PROJECTION_COLS_CH = """s.project_id,
+s.session_id,
+s.user_uuid,
+s.user_id,
+s.user_os,
+s.user_browser,
+s.user_device,
+s.user_device_type,
+s.user_country,
+s.datetime AS start_ts,
+s.duration,
+s.events_count,
+s.pages_count,
+s.errors_count,
+s.user_anonymous_id,
+s.platform
+-- ,
+-- s.issue_score,
+-- to_jsonb(s.issue_types) AS issue_types,
+-- favorite_sessions.session_id NOTNULL            AS favorite,
+-- COALESCE((SELECT TRUE
+--  FROM public.user_viewed_sessions AS fs
+--  WHERE s.session_id = fs.session_id
+--    AND fs.user_id = %(userId)s LIMIT 1), FALSE) AS viewed 
+   """
 
 
 def __group_metadata(session, project_metadata):
@@ -270,6 +297,154 @@ def search2_pg(data: schemas.SessionsSearchPayloadSchema, project_id, user_id, e
 
         total = sessions["count"]
         sessions = sessions["sessions"]
+
+    if data.group_by_user:
+        for i, s in enumerate(sessions):
+            sessions[i] = {**s.pop("last_session")[0], **s}
+            sessions[i].pop("rn")
+            sessions[i]["metadata"] = {k["key"]: sessions[i][f'metadata_{k["index"]}'] for k in meta_keys \
+                                       if sessions[i][f'metadata_{k["index"]}'] is not None}
+    else:
+        for i, s in enumerate(sessions):
+            sessions[i]["metadata"] = {k["key"]: sessions[i][f'metadata_{k["index"]}'] for k in meta_keys \
+                                       if sessions[i][f'metadata_{k["index"]}'] is not None}
+    # if not data.group_by_user and data.sort is not None and data.sort != "session_id":
+    #     sessions = sorted(sessions, key=lambda s: s[helper.key_to_snake_case(data.sort)],
+    #                       reverse=data.order.upper() == "DESC")
+    return {
+        'total': total,
+        'sessions': helper.list_to_camel_case(sessions)
+    }
+
+
+def search2_ch(data: schemas.SessionsSearchPayloadSchema, project_id, user_id, errors_only=False,
+               error_status=schemas.ErrorStatus.all, count_only=False, issue=None):
+    full_args, query_part = search_query_parts_ch(data=data, error_status=error_status, errors_only=errors_only,
+                                                  favorite_only=data.bookmarked, issue=issue, project_id=project_id,
+                                                  user_id=user_id)
+    if data.sort == "startTs":
+        data.sort = "datetime"
+    if data.limit is not None and data.page is not None:
+        full_args["sessions_limit_s"] = (data.page - 1) * data.limit
+        full_args["sessions_limit_e"] = data.page * data.limit
+        full_args["sessions_limit"] = data.limit
+    else:
+        full_args["sessions_limit_s"] = 1
+        full_args["sessions_limit_e"] = 200
+        full_args["sessions_limit"] = 200
+
+    meta_keys = []
+    with ch_client.ClickHouseClient() as cur:
+        if errors_only:
+            main_query = cur.mogrify(f"""SELECT DISTINCT er.error_id, ser.status, ser.parent_error_id, ser.payload,
+                                        COALESCE((SELECT TRUE
+                                         FROM public.user_favorite_sessions AS fs
+                                         WHERE s.session_id = fs.session_id
+                                           AND fs.user_id = %(userId)s), FALSE)   AS favorite,
+                                        COALESCE((SELECT TRUE
+                                                     FROM public.user_viewed_errors AS ve
+                                                     WHERE er.error_id = ve.error_id
+                                                       AND ve.user_id = %(userId)s LIMIT 1), FALSE) AS viewed
+                                {query_part};""", full_args)
+
+        elif count_only:
+            main_query = cur.mogrify(f"""SELECT COUNT(DISTINCT s.session_id) AS count_sessions, 
+                                                COUNT(DISTINCT s.user_uuid) AS count_users
+                                        {query_part};""", full_args)
+        elif data.group_by_user:
+            g_sort = "count(full_sessions)"
+            if data.order is None:
+                data.order = schemas.SortOrderType.desc
+            else:
+                data.order = data.order.upper()
+            if data.sort is not None and data.sort != 'sessionsCount':
+                sort = helper.key_to_snake_case(data.sort)
+                g_sort = f"{'MIN' if data.order == schemas.SortOrderType.desc else 'MAX'}({sort})"
+            else:
+                sort = 'start_ts'
+
+            meta_keys = metadata.get(project_id=project_id)
+            main_query = cur.mogrify(f"""SELECT COUNT(*) AS count,
+                                                COALESCE(JSONB_AGG(users_sessions) 
+                                                    FILTER (WHERE rn>%(sessions_limit_s)s AND rn<=%(sessions_limit_e)s), '[]'::JSONB) AS sessions
+                                        FROM (SELECT user_id,
+                                                 count(full_sessions)                                   AS user_sessions_count,
+                                                 jsonb_agg(full_sessions) FILTER (WHERE rn <= 1)        AS last_session,
+                                                 MIN(full_sessions.start_ts)                            AS first_session_ts,
+                                                 ROW_NUMBER() OVER (ORDER BY {g_sort} {data.order}) AS rn
+                                            FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY {sort} {data.order}) AS rn 
+                                                FROM (SELECT DISTINCT ON(s.session_id) {SESSION_PROJECTION_COLS} 
+                                                                    {"," if len(meta_keys) > 0 else ""}{",".join([f'metadata_{m["index"]}' for m in meta_keys])}
+                                                    {query_part}
+                                                    ) AS filtred_sessions
+                                                ) AS full_sessions
+                                                GROUP BY user_id
+                                            ) AS users_sessions;""",
+                                     full_args)
+        else:
+            if data.order is None:
+                data.order = schemas.SortOrderType.desc
+            sort = 'session_id'
+            if data.sort is not None and data.sort != "session_id":
+                # sort += " " + data.order + "," + helper.key_to_snake_case(data.sort)
+                sort = helper.key_to_snake_case(data.sort)
+
+            meta_keys = metadata.get(project_id=project_id)
+            # main_query = cur.format(f"""SELECT COUNT(full_sessions) AS count,
+            #                                     COALESCE(JSONB_AGG(full_sessions)
+            #                                         FILTER (WHERE rn>%(sessions_limit_s)s AND rn<=%(sessions_limit_e)s), '[]'::JSONB) AS sessions
+            #                                 FROM (SELECT *, ROW_NUMBER() OVER (ORDER BY {sort} {data.order}, issue_score DESC) AS rn
+            #                                 FROM (SELECT DISTINCT ON(s.session_id) {SESSION_PROJECTION_COLS}
+            #                                                     {"," if len(meta_keys) > 0 else ""}{",".join([f'metadata_{m["index"]}' for m in meta_keys])}
+            #                                 {query_part}
+            #                                 ORDER BY s.session_id desc) AS filtred_sessions
+            #                                 ORDER BY {sort} {data.order}, issue_score DESC) AS full_sessions;""",
+            #                          full_args)
+            main_query = cur.format(f"""SELECT COUNT(*) AS total
+                                        {query_part};""",
+                                    full_args)
+            try:
+                total = cur.execute(main_query)
+                if total and len(total) > 0:
+                    total = total[0].get("total", 0)
+                else:
+                    total = 0
+            except Exception as err:
+                print("--------- SESSIONS SEARCH QUERY EXCEPTION -----------")
+                print(main_query)
+                print("--------- PAYLOAD -----------")
+                print(data.json())
+                print("--------------------")
+                raise err
+            if total == 0 or count_only:
+                return {"total": total, "sessions": []}
+            main_query = cur.format(f"""SELECT {SESSION_PROJECTION_COLS_CH}
+                                            {"," if len(meta_keys) > 0 else ""}{",".join([f'metadata_{m["index"]}' for m in meta_keys])}
+                                        {query_part}
+                                        ORDER BY {sort} {data.order}
+                                        LIMIT %(sessions_limit)s OFFSET %(sessions_limit_s)s;""",
+                                    full_args)
+        # print("--------------------")
+        # print(main_query)
+        # print("--------------------")
+        try:
+            sessions = cur.execute(main_query)
+        except Exception as err:
+            print("--------- SESSIONS SEARCH QUERY EXCEPTION -----------")
+            print(main_query)
+            print("--------- PAYLOAD -----------")
+            print(data.json())
+            print("--------------------")
+            raise err
+        if errors_only:
+            return helper.list_to_camel_case(cur.fetchall())
+
+        # if count_only:
+        #     return helper.dict_to_camel_case(sessions)
+        for s in sessions:
+            s["session_id"] = str(s["session_id"])
+        # total = sessions["count"]
+        # sessions = sessions["sessions"]
 
     if data.group_by_user:
         for i, s in enumerate(sessions):
@@ -1020,6 +1195,635 @@ def search_query_parts(data, error_status, errors_only, favorite_only, issue, pr
         extra_constraints.append("ev.timestamp<=%(endDate)s")
     query_part = f"""\
                         FROM {f"({events_query_part}) AS f" if len(events_query_part) > 0 else "public.sessions AS s"}
+                        {extra_join}
+                        {"INNER JOIN public.sessions AS s USING(session_id)" if len(events_query_part) > 0 else ""}
+                        {extra_from}
+                        WHERE 
+                          {" AND ".join(extra_constraints)}"""
+    return full_args, query_part
+
+
+def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue, project_id, user_id, extra_event=None):
+    ss_constraints = []
+    full_args = {"project_id": project_id, "startDate": data.startDate, "endDate": data.endDate,
+                 "projectId": project_id, "userId": user_id}
+    extra_constraints = [
+        "s.project_id = %(project_id)s",
+        "s.duration IS NOT NULL"
+    ]
+    extra_from = ""
+    events_query_part = ""
+    if len(data.filters) > 0:
+        meta_keys = None
+        for i, f in enumerate(data.filters):
+            if not isinstance(f.value, list):
+                f.value = [f.value]
+            filter_type = f.type
+            f.value = helper.values_for_operator(value=f.value, op=f.operator)
+            f_k = f"f_value{i}"
+            full_args = {**full_args, **_multiple_values(f.value, value_key=f_k)}
+            op = __get_sql_operator(f.operator) \
+                if filter_type not in [schemas.FilterType.events_count] else f.operator
+            is_any = _isAny_opreator(f.operator)
+            is_undefined = _isUndefined_operator(f.operator)
+            if not is_any and not is_undefined and len(f.value) == 0:
+                continue
+            is_not = False
+            if __is_negation_operator(f.operator):
+                is_not = True
+            if filter_type == schemas.FilterType.user_browser:
+                if is_any:
+                    extra_constraints.append('s.user_browser IS NOT NULL')
+                    ss_constraints.append('ms.user_browser IS NOT NULL')
+                else:
+                    extra_constraints.append(
+                        _multiple_conditions(f's.user_browser {op} %({f_k})s', f.value, is_not=is_not, value_key=f_k))
+                    ss_constraints.append(
+                        _multiple_conditions(f'ms.user_browser {op} %({f_k})s', f.value, is_not=is_not, value_key=f_k))
+
+            elif filter_type in [schemas.FilterType.user_os, schemas.FilterType.user_os_ios]:
+                if is_any:
+                    extra_constraints.append('s.user_os IS NOT NULL')
+                    ss_constraints.append('ms.user_os IS NOT NULL')
+                else:
+                    extra_constraints.append(
+                        _multiple_conditions(f's.user_os {op} %({f_k})s', f.value, is_not=is_not, value_key=f_k))
+                    ss_constraints.append(
+                        _multiple_conditions(f'ms.user_os {op} %({f_k})s', f.value, is_not=is_not, value_key=f_k))
+
+            elif filter_type in [schemas.FilterType.user_device, schemas.FilterType.user_device_ios]:
+                if is_any:
+                    extra_constraints.append('s.user_device IS NOT NULL')
+                    ss_constraints.append('ms.user_device IS NOT NULL')
+                else:
+                    extra_constraints.append(
+                        _multiple_conditions(f's.user_device {op} %({f_k})s', f.value, is_not=is_not, value_key=f_k))
+                    ss_constraints.append(
+                        _multiple_conditions(f'ms.user_device {op} %({f_k})s', f.value, is_not=is_not, value_key=f_k))
+
+            elif filter_type in [schemas.FilterType.user_country, schemas.FilterType.user_country_ios]:
+                if is_any:
+                    extra_constraints.append('s.user_country IS NOT NULL')
+                    ss_constraints.append('ms.user_country IS NOT NULL')
+                else:
+                    extra_constraints.append(
+                        _multiple_conditions(f's.user_country {op} %({f_k})s', f.value, is_not=is_not, value_key=f_k))
+                    ss_constraints.append(
+                        _multiple_conditions(f'ms.user_country {op} %({f_k})s', f.value, is_not=is_not, value_key=f_k))
+
+            elif filter_type in [schemas.FilterType.utm_source]:
+                if is_any:
+                    extra_constraints.append('s.utm_source IS NOT NULL')
+                    ss_constraints.append('ms.utm_source  IS NOT NULL')
+                elif is_undefined:
+                    extra_constraints.append('s.utm_source IS NULL')
+                    ss_constraints.append('ms.utm_source  IS NULL')
+                else:
+                    extra_constraints.append(
+                        _multiple_conditions(f's.utm_source {op} %({f_k})s::text', f.value, is_not=is_not,
+                                             value_key=f_k))
+                    ss_constraints.append(
+                        _multiple_conditions(f'ms.utm_source {op} %({f_k})s::text', f.value, is_not=is_not,
+                                             value_key=f_k))
+            elif filter_type in [schemas.FilterType.utm_medium]:
+                if is_any:
+                    extra_constraints.append('s.utm_medium IS NOT NULL')
+                    ss_constraints.append('ms.utm_medium IS NOT NULL')
+                elif is_undefined:
+                    extra_constraints.append('s.utm_medium IS NULL')
+                    ss_constraints.append('ms.utm_medium IS NULL')
+                else:
+                    extra_constraints.append(
+                        _multiple_conditions(f's.utm_medium {op} %({f_k})s::text', f.value, is_not=is_not,
+                                             value_key=f_k))
+                    ss_constraints.append(
+                        _multiple_conditions(f'ms.utm_medium {op} %({f_k})s::text', f.value, is_not=is_not,
+                                             value_key=f_k))
+            elif filter_type in [schemas.FilterType.utm_campaign]:
+                if is_any:
+                    extra_constraints.append('s.utm_campaign IS NOT NULL')
+                    ss_constraints.append('ms.utm_campaign IS NOT NULL')
+                elif is_undefined:
+                    extra_constraints.append('s.utm_campaign IS NULL')
+                    ss_constraints.append('ms.utm_campaign IS NULL')
+                else:
+                    extra_constraints.append(
+                        _multiple_conditions(f's.utm_campaign {op} %({f_k})s::text', f.value, is_not=is_not,
+                                             value_key=f_k))
+                    ss_constraints.append(
+                        _multiple_conditions(f'ms.utm_campaign {op} %({f_k})s::text', f.value, is_not=is_not,
+                                             value_key=f_k))
+
+            elif filter_type == schemas.FilterType.duration:
+                if len(f.value) > 0 and f.value[0] is not None:
+                    extra_constraints.append("s.duration >= %(minDuration)s")
+                    ss_constraints.append("ms.duration >= %(minDuration)s")
+                    full_args["minDuration"] = f.value[0]
+                if len(f.value) > 1 and f.value[1] is not None and int(f.value[1]) > 0:
+                    extra_constraints.append("s.duration <= %(maxDuration)s")
+                    ss_constraints.append("ms.duration <= %(maxDuration)s")
+                    full_args["maxDuration"] = f.value[1]
+            elif filter_type == schemas.FilterType.referrer:
+                extra_from += f"INNER JOIN {events.event_type.LOCATION.table} AS p USING(session_id)"
+                if is_any:
+                    extra_constraints.append('p.base_referrer IS NOT NULL')
+                else:
+                    extra_constraints.append(
+                        _multiple_conditions(f"p.base_referrer {op} %({f_k})s", f.value, is_not=is_not, value_key=f_k))
+            elif filter_type == events.event_type.METADATA.ui_type:
+                # get metadata list only if you need it
+                if meta_keys is None:
+                    meta_keys = metadata.get(project_id=project_id)
+                    meta_keys = {m["key"]: m["index"] for m in meta_keys}
+                if f.source in meta_keys.keys():
+                    if is_any:
+                        extra_constraints.append(f"s.{metadata.index_to_colname(meta_keys[f.source])} IS NOT NULL")
+                        ss_constraints.append(f"ms.{metadata.index_to_colname(meta_keys[f.source])} IS NOT NULL")
+                    elif is_undefined:
+                        extra_constraints.append(f"s.{metadata.index_to_colname(meta_keys[f.source])} IS NULL")
+                        ss_constraints.append(f"ms.{metadata.index_to_colname(meta_keys[f.source])} IS NULL")
+                    else:
+                        extra_constraints.append(
+                            _multiple_conditions(
+                                f"s.{metadata.index_to_colname(meta_keys[f.source])} {op} %({f_k})s::text",
+                                f.value, is_not=is_not, value_key=f_k))
+                        ss_constraints.append(
+                            _multiple_conditions(
+                                f"ms.{metadata.index_to_colname(meta_keys[f.source])} {op} %({f_k})s::text",
+                                f.value, is_not=is_not, value_key=f_k))
+            elif filter_type in [schemas.FilterType.user_id, schemas.FilterType.user_id_ios]:
+                if is_any:
+                    extra_constraints.append('s.user_id IS NOT NULL')
+                    ss_constraints.append('ms.user_id IS NOT NULL')
+                elif is_undefined:
+                    extra_constraints.append('s.user_id IS NULL')
+                    ss_constraints.append('ms.user_id IS NULL')
+                else:
+                    extra_constraints.append(
+                        _multiple_conditions(f"s.user_id {op} %({f_k})s::text", f.value, is_not=is_not, value_key=f_k))
+                    ss_constraints.append(
+                        _multiple_conditions(f"ms.user_id {op} %({f_k})s::text", f.value, is_not=is_not, value_key=f_k))
+            elif filter_type in [schemas.FilterType.user_anonymous_id,
+                                 schemas.FilterType.user_anonymous_id_ios]:
+                if is_any:
+                    extra_constraints.append('s.user_anonymous_id IS NOT NULL')
+                    ss_constraints.append('ms.user_anonymous_id IS NOT NULL')
+                elif is_undefined:
+                    extra_constraints.append('s.user_anonymous_id IS NULL')
+                    ss_constraints.append('ms.user_anonymous_id IS NULL')
+                else:
+                    extra_constraints.append(
+                        _multiple_conditions(f"s.user_anonymous_id {op} %({f_k})s::text", f.value, is_not=is_not,
+                                             value_key=f_k))
+                    ss_constraints.append(
+                        _multiple_conditions(f"ms.user_anonymous_id {op} %({f_k})s::text", f.value, is_not=is_not,
+                                             value_key=f_k))
+            elif filter_type in [schemas.FilterType.rev_id, schemas.FilterType.rev_id_ios]:
+                if is_any:
+                    extra_constraints.append('s.rev_id IS NOT NULL')
+                    ss_constraints.append('ms.rev_id IS NOT NULL')
+                elif is_undefined:
+                    extra_constraints.append('s.rev_id IS NULL')
+                    ss_constraints.append('ms.rev_id IS NULL')
+                else:
+                    extra_constraints.append(
+                        _multiple_conditions(f"s.rev_id {op} %({f_k})s::text", f.value, is_not=is_not, value_key=f_k))
+                    ss_constraints.append(
+                        _multiple_conditions(f"ms.rev_id {op} %({f_k})s::text", f.value, is_not=is_not, value_key=f_k))
+            elif filter_type == schemas.FilterType.platform:
+                # op = __get_sql_operator(f.operator)
+                extra_constraints.append(
+                    _multiple_conditions(f"s.user_device_type {op} %({f_k})s", f.value, is_not=is_not,
+                                         value_key=f_k))
+                ss_constraints.append(
+                    _multiple_conditions(f"ms.user_device_type {op} %({f_k})s", f.value, is_not=is_not,
+                                         value_key=f_k))
+            elif filter_type == schemas.FilterType.issue:
+                if is_any:
+                    extra_constraints.append("array_length(s.issue_types, 1) > 0")
+                    ss_constraints.append("array_length(ms.issue_types, 1) > 0")
+                else:
+                    extra_constraints.append(
+                        _multiple_conditions(f"%({f_k})s {op} ANY (s.issue_types)", f.value, is_not=is_not,
+                                             value_key=f_k))
+                    ss_constraints.append(
+                        _multiple_conditions(f"%({f_k})s {op} ANY (ms.issue_types)", f.value, is_not=is_not,
+                                             value_key=f_k))
+            elif filter_type == schemas.FilterType.events_count:
+                extra_constraints.append(
+                    _multiple_conditions(f"s.events_count {op} %({f_k})s", f.value, is_not=is_not,
+                                         value_key=f_k))
+                ss_constraints.append(
+                    _multiple_conditions(f"ms.events_count {op} %({f_k})s", f.value, is_not=is_not,
+                                         value_key=f_k))
+    # ---------------------------------------------------------------------------
+    if len(data.events) > 0:
+        valid_events_count = 0
+        for event in data.events:
+            is_any = _isAny_opreator(event.operator)
+            if not isinstance(event.value, list):
+                event.value = [event.value]
+            if __is_valid_event(is_any=is_any, event=event):
+                valid_events_count += 1
+        events_query_from = []
+        event_index = 0
+        or_events = data.events_order == schemas.SearchEventOrder._or
+        # events_joiner = " FULL JOIN " if or_events else " INNER JOIN LATERAL "
+        events_joiner = " UNION " if or_events else " INNER JOIN LATERAL "
+        for i, event in enumerate(data.events):
+            event_type = event.type
+            is_any = _isAny_opreator(event.operator)
+            if not isinstance(event.value, list):
+                event.value = [event.value]
+            if not __is_valid_event(is_any=is_any, event=event):
+                continue
+            op = __get_sql_operator(event.operator)
+            is_not = False
+            if __is_negation_operator(event.operator):
+                is_not = True
+                op = __reverse_sql_operator(op)
+            if event_index == 0 or or_events:
+                event_from = "%s INNER JOIN public.sessions AS ms USING (session_id)"
+                event_where = ["ms.project_id = %(projectId)s", "main.timestamp >= %(startDate)s",
+                               "main.timestamp <= %(endDate)s", "ms.start_ts >= %(startDate)s",
+                               "ms.start_ts <= %(endDate)s", "ms.duration IS NOT NULL"]
+                if favorite_only and not errors_only:
+                    event_from += "INNER JOIN public.user_favorite_sessions AS fs USING(session_id)"
+                    event_where.append("fs.user_id = %(userId)s")
+            else:
+                event_from = "%s"
+                event_where = ["main.timestamp >= %(startDate)s", "main.timestamp <= %(endDate)s",
+                               "main.session_id=event_0.session_id"]
+                if data.events_order == schemas.SearchEventOrder._then:
+                    event_where.append(f"event_{event_index - 1}.timestamp <= main.timestamp")
+            e_k = f"e_value{i}"
+            s_k = e_k + "_source"
+            if event.type != schemas.PerformanceEventType.time_between_events:
+                event.value = helper.values_for_operator(value=event.value, op=event.operator)
+                full_args = {**full_args,
+                             **_multiple_values(event.value, value_key=e_k),
+                             **_multiple_values(event.source, value_key=s_k)}
+
+            if event_type == events.event_type.CLICK.ui_type:
+                event_from = event_from % f"{events.event_type.CLICK.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.CLICK.column} {op} %({e_k})s", event.value,
+                                             value_key=e_k))
+
+            elif event_type == events.event_type.INPUT.ui_type:
+                event_from = event_from % f"{events.event_type.INPUT.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.INPUT.column} {op} %({e_k})s", event.value,
+                                             value_key=e_k))
+                if event.source is not None and len(event.source) > 0:
+                    event_where.append(_multiple_conditions(f"main.value ILIKE %(custom{i})s", event.source,
+                                                            value_key=f"custom{i}"))
+                    full_args = {**full_args, **_multiple_values(event.source, value_key=f"custom{i}")}
+
+            elif event_type == events.event_type.LOCATION.ui_type:
+                event_from = event_from % f"{events.event_type.LOCATION.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.LOCATION.column} {op} %({e_k})s",
+                                             event.value, value_key=e_k))
+            elif event_type == events.event_type.CUSTOM.ui_type:
+                event_from = event_from % f"{events.event_type.CUSTOM.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.CUSTOM.column} {op} %({e_k})s", event.value,
+                                             value_key=e_k))
+            elif event_type == events.event_type.REQUEST.ui_type:
+                event_from = event_from % f"{events.event_type.REQUEST.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.REQUEST.column} {op} %({e_k})s", event.value,
+                                             value_key=e_k))
+            elif event_type == events.event_type.GRAPHQL.ui_type:
+                event_from = event_from % f"{events.event_type.GRAPHQL.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.GRAPHQL.column} {op} %({e_k})s", event.value,
+                                             value_key=e_k))
+            elif event_type == events.event_type.STATEACTION.ui_type:
+                event_from = event_from % f"{events.event_type.STATEACTION.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.STATEACTION.column} {op} %({e_k})s",
+                                             event.value, value_key=e_k))
+            elif event_type == events.event_type.ERROR.ui_type:
+                event_from = event_from % f"{events.event_type.ERROR.table} AS main INNER JOIN public.errors AS main1 USING(error_id)"
+                event.source = tuple(event.source)
+                if not is_any and event.value not in [None, "*", ""]:
+                    event_where.append(
+                        _multiple_conditions(f"(main1.message {op} %({e_k})s OR main1.name {op} %({e_k})s)",
+                                             event.value, value_key=e_k))
+                if event.source[0] not in [None, "*", ""]:
+                    event_where.append(_multiple_conditions(f"main1.source = %({s_k})s", event.value, value_key=s_k))
+
+
+            # ----- IOS
+            elif event_type == events.event_type.CLICK_IOS.ui_type:
+                event_from = event_from % f"{events.event_type.CLICK_IOS.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.CLICK_IOS.column} {op} %({e_k})s",
+                                             event.value, value_key=e_k))
+
+            elif event_type == events.event_type.INPUT_IOS.ui_type:
+                event_from = event_from % f"{events.event_type.INPUT_IOS.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.INPUT_IOS.column} {op} %({e_k})s",
+                                             event.value, value_key=e_k))
+                if event.source is not None and len(event.source) > 0:
+                    event_where.append(_multiple_conditions(f"main.value ILIKE %(custom{i})s", event.source,
+                                                            value_key="custom{i}"))
+                    full_args = {**full_args, **_multiple_values(event.source, f"custom{i}")}
+            elif event_type == events.event_type.VIEW_IOS.ui_type:
+                event_from = event_from % f"{events.event_type.VIEW_IOS.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.VIEW_IOS.column} {op} %({e_k})s",
+                                             event.value, value_key=e_k))
+            elif event_type == events.event_type.CUSTOM_IOS.ui_type:
+                event_from = event_from % f"{events.event_type.CUSTOM_IOS.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.CUSTOM_IOS.column} {op} %({e_k})s",
+                                             event.value, value_key=e_k))
+            elif event_type == events.event_type.REQUEST_IOS.ui_type:
+                event_from = event_from % f"{events.event_type.REQUEST_IOS.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.REQUEST_IOS.column} {op} %({e_k})s",
+                                             event.value, value_key=e_k))
+            elif event_type == events.event_type.ERROR_IOS.ui_type:
+                event_from = event_from % f"{events.event_type.ERROR_IOS.table} AS main INNER JOIN public.crashes_ios AS main1 USING(crash_id)"
+                if not is_any and event.value not in [None, "*", ""]:
+                    event_where.append(
+                        _multiple_conditions(f"(main1.reason {op} %({e_k})s OR main1.name {op} %({e_k})s)",
+                                             event.value, value_key=e_k))
+            elif event_type == schemas.PerformanceEventType.fetch_failed:
+                event_from = event_from % f"{events.event_type.REQUEST.table} AS main "
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.REQUEST.column} {op} %({e_k})s",
+                                             event.value, value_key=e_k))
+                col = performance_event.get_col(event_type)
+                colname = col["column"]
+                event_where.append(f"main.{colname} = FALSE")
+            # elif event_type == schemas.PerformanceEventType.fetch_duration:
+            #     event_from = event_from % f"{events.event_type.REQUEST.table} AS main "
+            #     if not is_any:
+            #         event_where.append(
+            #             _multiple_conditions(f"main.{events.event_type.REQUEST.column} {op} %({e_k})s",
+            #                                  event.value, value_key=e_k))
+            #     col = performance_event.get_col(event_type)
+            #     colname = col["column"]
+            #     tname = "main"
+            #     e_k += "_custom"
+            #     full_args = {**full_args, **_multiple_values(event.source, value_key=e_k)}
+            #     event_where.append(f"{tname}.{colname} IS NOT NULL AND {tname}.{colname}>0 AND " +
+            #                        _multiple_conditions(f"{tname}.{colname} {event.sourceOperator} %({e_k})s",
+            #                                             event.source, value_key=e_k))
+            elif event_type in [schemas.PerformanceEventType.location_dom_complete,
+                                schemas.PerformanceEventType.location_largest_contentful_paint_time,
+                                schemas.PerformanceEventType.location_ttfb,
+                                schemas.PerformanceEventType.location_avg_cpu_load,
+                                schemas.PerformanceEventType.location_avg_memory_usage
+                                ]:
+                event_from = event_from % f"{events.event_type.LOCATION.table} AS main "
+                col = performance_event.get_col(event_type)
+                colname = col["column"]
+                tname = "main"
+                if col.get("extraJoin") is not None:
+                    tname = "ej"
+                    event_from += f" INNER JOIN {col['extraJoin']} AS {tname} USING(session_id)"
+                    event_where += [f"{tname}.timestamp >= main.timestamp", f"{tname}.timestamp >= %(startDate)s",
+                                    f"{tname}.timestamp <= %(endDate)s"]
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(f"main.{events.event_type.LOCATION.column} {op} %({e_k})s",
+                                             event.value, value_key=e_k))
+                e_k += "_custom"
+                full_args = {**full_args, **_multiple_values(event.source, value_key=e_k)}
+
+                event_where.append(f"{tname}.{colname} IS NOT NULL AND {tname}.{colname}>0 AND " +
+                                   _multiple_conditions(f"{tname}.{colname} {event.sourceOperator} %({e_k})s",
+                                                        event.source, value_key=e_k))
+            elif event_type == schemas.PerformanceEventType.time_between_events:
+                event_from = event_from % f"{getattr(events.event_type, event.value[0].type).table} AS main INNER JOIN {getattr(events.event_type, event.value[1].type).table} AS main2 USING(session_id) "
+                if not isinstance(event.value[0].value, list):
+                    event.value[0].value = [event.value[0].value]
+                if not isinstance(event.value[1].value, list):
+                    event.value[1].value = [event.value[1].value]
+                event.value[0].value = helper.values_for_operator(value=event.value[0].value,
+                                                                  op=event.value[0].operator)
+                event.value[1].value = helper.values_for_operator(value=event.value[1].value,
+                                                                  op=event.value[0].operator)
+                e_k1 = e_k + "_e1"
+                e_k2 = e_k + "_e2"
+                full_args = {**full_args,
+                             **_multiple_values(event.value[0].value, value_key=e_k1),
+                             **_multiple_values(event.value[1].value, value_key=e_k2)}
+                s_op = __get_sql_operator(event.value[0].operator)
+                event_where += ["main2.timestamp >= %(startDate)s", "main2.timestamp <= %(endDate)s"]
+                if event_index > 0 and not or_events:
+                    event_where.append("main2.session_id=event_0.session_id")
+                is_any = _isAny_opreator(event.value[0].operator)
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(
+                            f"main.{getattr(events.event_type, event.value[0].type).column} {s_op} %({e_k1})s",
+                            event.value[0].value, value_key=e_k1))
+                s_op = __get_sql_operator(event.value[1].operator)
+                is_any = _isAny_opreator(event.value[1].operator)
+                if not is_any:
+                    event_where.append(
+                        _multiple_conditions(
+                            f"main2.{getattr(events.event_type, event.value[1].type).column} {s_op} %({e_k2})s",
+                            event.value[1].value, value_key=e_k2))
+
+                e_k += "_custom"
+                full_args = {**full_args, **_multiple_values(event.source, value_key=e_k)}
+                event_where.append(
+                    _multiple_conditions(f"main2.timestamp - main.timestamp {event.sourceOperator} %({e_k})s",
+                                         event.source, value_key=e_k))
+
+            elif event_type == schemas.EventType.request_details:
+                event_from = event_from % f"{events.event_type.REQUEST.table} AS main "
+                apply = False
+                for j, f in enumerate(event.filters):
+                    is_any = _isAny_opreator(f.operator)
+                    if is_any or len(f.value) == 0:
+                        continue
+                    f.value = helper.values_for_operator(value=f.value, op=f.operator)
+                    op = __get_sql_operator(f.operator)
+                    e_k_f = e_k + f"_fetch{j}"
+                    full_args = {**full_args, **_multiple_values(f.value, value_key=e_k_f)}
+                    if f.type == schemas.FetchFilterType._url:
+                        event_where.append(
+                            _multiple_conditions(f"main.{events.event_type.REQUEST.column} {op} %({e_k_f})s", f.value,
+                                                 value_key=e_k_f))
+                        apply = True
+                    elif f.type == schemas.FetchFilterType._status_code:
+                        event_where.append(
+                            _multiple_conditions(f"main.status_code {f.operator} %({e_k_f})s", f.value,
+                                                 value_key=e_k_f))
+                        apply = True
+                    elif f.type == schemas.FetchFilterType._method:
+                        event_where.append(
+                            _multiple_conditions(f"main.method {op} %({e_k_f})s", f.value, value_key=e_k_f))
+                        apply = True
+                    elif f.type == schemas.FetchFilterType._duration:
+                        event_where.append(
+                            _multiple_conditions(f"main.duration {f.operator} %({e_k_f})s", f.value, value_key=e_k_f))
+                        apply = True
+                    elif f.type == schemas.FetchFilterType._request_body:
+                        event_where.append(
+                            _multiple_conditions(f"main.request_body {op} %({e_k_f})s", f.value, value_key=e_k_f))
+                        apply = True
+                    elif f.type == schemas.FetchFilterType._response_body:
+                        event_where.append(
+                            _multiple_conditions(f"main.response_body {op} %({e_k_f})s", f.value, value_key=e_k_f))
+                        apply = True
+                    else:
+                        print(f"undefined FETCH filter: {f.type}")
+                if not apply:
+                    continue
+            elif event_type == schemas.EventType.graphql_details:
+                event_from = event_from % f"{events.event_type.GRAPHQL.table} AS main "
+                for j, f in enumerate(event.filters):
+                    is_any = _isAny_opreator(f.operator)
+                    if is_any or len(f.value) == 0:
+                        continue
+                    f.value = helper.values_for_operator(value=f.value, op=f.operator)
+                    op = __get_sql_operator(f.operator)
+                    e_k_f = e_k + f"_graphql{j}"
+                    full_args = {**full_args, **_multiple_values(f.value, value_key=e_k_f)}
+                    if f.type == schemas.GraphqlFilterType._name:
+                        event_where.append(
+                            _multiple_conditions(f"main.{events.event_type.GRAPHQL.column} {op} %({e_k_f})s", f.value,
+                                                 value_key=e_k_f))
+                    elif f.type == schemas.GraphqlFilterType._method:
+                        event_where.append(
+                            _multiple_conditions(f"main.method {op} %({e_k_f})s", f.value, value_key=e_k_f))
+                    elif f.type == schemas.GraphqlFilterType._request_body:
+                        event_where.append(
+                            _multiple_conditions(f"main.request_body {op} %({e_k_f})s", f.value, value_key=e_k_f))
+                    elif f.type == schemas.GraphqlFilterType._response_body:
+                        event_where.append(
+                            _multiple_conditions(f"main.response_body {op} %({e_k_f})s", f.value, value_key=e_k_f))
+                    else:
+                        print(f"undefined GRAPHQL filter: {f.type}")
+            else:
+                continue
+            if event_index == 0 or or_events:
+                event_where += ss_constraints
+            if is_not:
+                if event_index == 0 or or_events:
+                    events_query_from.append(f"""\
+                                    (SELECT
+                                        session_id, 
+                                        0 AS timestamp
+                                      FROM sessions
+                                      WHERE EXISTS(SELECT session_id 
+                                                    FROM {event_from} 
+                                                    WHERE {" AND ".join(event_where)} 
+                                                        AND sessions.session_id=ms.session_id) IS FALSE
+                                        AND project_id = %(projectId)s 
+                                        AND start_ts >= %(startDate)s
+                                        AND start_ts <= %(endDate)s
+                                        AND duration IS NOT NULL
+                                    ) {"" if or_events else (f"AS event_{event_index}" + ("ON(TRUE)" if event_index > 0 else ""))}\
+                                    """)
+                else:
+                    events_query_from.append(f"""\
+            (SELECT
+                event_0.session_id, 
+                event_{event_index - 1}.timestamp AS timestamp
+              WHERE EXISTS(SELECT session_id FROM {event_from} WHERE {" AND ".join(event_where)}) IS FALSE
+            ) AS event_{event_index} {"ON(TRUE)" if event_index > 0 else ""}\
+            """)
+            else:
+                events_query_from.append(f"""\
+            (SELECT main.session_id, {"MIN" if event_index < (valid_events_count - 1) else "MAX"}(main.timestamp) AS timestamp
+              FROM {event_from}
+              WHERE {" AND ".join(event_where)}
+              GROUP BY 1
+            ) {"" if or_events else (f"AS event_{event_index} " + ("ON(TRUE)" if event_index > 0 else ""))}\
+            """)
+            event_index += 1
+        if event_index > 0:
+            if or_events:
+                events_query_part = f"""SELECT
+                                            session_id, 
+                                            MIN(timestamp) AS first_event_ts, 
+                                            MAX(timestamp) AS last_event_ts
+                                        FROM ({events_joiner.join(events_query_from)}) AS u
+                                        GROUP BY 1"""
+            else:
+                events_query_part = f"""SELECT
+                                        event_0.session_id,
+                                        MIN(event_0.timestamp) AS first_event_ts,
+                                        MAX(event_{event_index - 1}.timestamp) AS last_event_ts
+                                    FROM {events_joiner.join(events_query_from)}
+                                    GROUP BY 1"""
+    else:
+        data.events = []
+    # ---------------------------------------------------------------------------
+    if data.startDate is not None:
+        extra_constraints.append("s.datetime >= toDateTime(%(startDate)s/1000)")
+    if data.endDate is not None:
+        extra_constraints.append("s.datetime <= toDateTime(%(endDate)s/1000)")
+    # if data.platform is not None:
+    #     if data.platform == schemas.PlatformType.mobile:
+    #         extra_constraints.append(b"s.user_os in ('Android','BlackBerry OS','iOS','Tizen','Windows Phone')")
+    #     elif data.platform == schemas.PlatformType.desktop:
+    #         extra_constraints.append(
+    #             b"s.user_os in ('Chrome OS','Fedora','Firefox OS','Linux','Mac OS X','Ubuntu','Windows')")
+
+    if errors_only:
+        extra_from += f" INNER JOIN {events.event_type.ERROR.table} AS er USING (session_id) INNER JOIN public.errors AS ser USING (error_id)"
+        extra_constraints.append("ser.source = 'js_exception'")
+        extra_constraints.append("ser.project_id = %(project_id)s")
+        if error_status != schemas.ErrorStatus.all:
+            extra_constraints.append("ser.status = %(error_status)s")
+            full_args["error_status"] = error_status
+        if favorite_only:
+            extra_from += " INNER JOIN public.user_favorite_errors AS ufe USING (error_id)"
+            extra_constraints.append("ufe.user_id = %(userId)s")
+    # extra_constraints = [extra.decode('UTF-8') + "\n" for extra in extra_constraints]
+    if favorite_only and not errors_only and user_id is not None:
+        extra_from += """INNER JOIN (SELECT user_id, session_id
+                                    FROM final.user_favorite_sessions
+                                    WHERE user_id = %(userId)s) AS favorite_sessions
+                                    USING (session_id)"""
+    elif not favorite_only and not errors_only and user_id is not None:
+        extra_from += """LEFT JOIN (SELECT session_id
+                                    FROM final.user_favorite_sessions
+                                    WHERE user_id = %(userId)s) AS favorite_sessions
+                                    USING (session_id)"""
+    extra_join = ""
+    if issue is not None:
+        extra_join = """
+                INNER JOIN LATERAL(SELECT TRUE FROM events_common.issues INNER JOIN public.issues AS p_issues USING (issue_id)
+                WHERE issues.session_id=f.session_id 
+                    AND p_issues.type=%(issue_type)s 
+                    AND p_issues.context_string=%(issue_contextString)s
+                    AND timestamp >= f.first_event_ts
+                    AND timestamp <= f.last_event_ts) AS issues ON(TRUE)
+                """
+        full_args["issue_contextString"] = issue["contextString"]
+        full_args["issue_type"] = issue["type"]
+    if extra_event:
+        extra_join += f"""INNER JOIN {extra_event} AS ev USING(session_id)"""
+        extra_constraints.append("ev.timestamp>=%(startDate)s")
+        extra_constraints.append("ev.timestamp<=%(endDate)s")
+    query_part = f"""\
+                        FROM {f"({events_query_part}) AS f" if len(events_query_part) > 0 else "final.sessions AS s"}
                         {extra_join}
                         {"INNER JOIN public.sessions AS s USING(session_id)" if len(events_query_part) > 0 else ""}
                         {extra_from}

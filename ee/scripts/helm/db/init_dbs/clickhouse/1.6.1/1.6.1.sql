@@ -1,6 +1,19 @@
 ALTER TABLE sessions
-    DROP COLUMN pages_count;
+--     DROP COLUMN pages_count,
+    ADD COLUMN platform LowCardinality(String) DEFAULT 'web';
 
+CREATE TABLE IF NOT EXISTS user_favorite_sessions
+(
+    user_id    UInt16,
+    session_id UInt64,
+    _timestamp DateTime DEFAULT now(),
+    sign       Int8
+) ENGINE = CollapsingMergeTree(sign)
+      PARTITION BY toYYYYMM(_timestamp)
+      ORDER BY (user_id, session_id)
+      TTL _timestamp + INTERVAL 1 MONTH
+      SETTINGS index_granularity = 512
+      COMMENT 'users favorite sessions';
 
 CREATE TABLE projects_metadata
 (
@@ -19,7 +32,8 @@ CREATE TABLE projects_metadata
 ) ENGINE = ReplacingMergeTree(_timestamp)
       PARTITION BY toYYYYMM(_timestamp)
       ORDER BY (project_id)
-      SETTINGS index_granularity = 512;
+      SETTINGS index_granularity = 512
+      COMMENT 'to associate a metadata-name with a metadata-col';
 
 CREATE TABLE IF NOT EXISTS events_s
 (
@@ -94,7 +108,8 @@ CREATE TABLE IF NOT EXISTS events_s
 ) ENGINE = MergeTree
       PARTITION BY toYYYYMM(datetime)
       ORDER BY (project_id, datetime, event_type, session_id)
-      TTL datetime + INTERVAL 1 MONTH;
+      TTL datetime + INTERVAL 1 MONTH
+      COMMENT 'All events';
 
 CREATE TABLE IF NOT EXISTS sessions
 (
@@ -115,10 +130,12 @@ CREATE TABLE IF NOT EXISTS sessions
     pages_count  UInt16,
     events_count UInt16,
     errors_count UInt16,
+    platform LowCardinality(String) DEFAULT 'web',
     utm_source Nullable(String),
     utm_medium Nullable(String),
     utm_campaign Nullable(String),
     user_id Nullable(String),
+    user_anonymous_id Nullable(String),
     metadata_1 Nullable(String),
     metadata_2 Nullable(String),
     metadata_3 Nullable(String),
@@ -129,18 +146,19 @@ CREATE TABLE IF NOT EXISTS sessions
     metadata_8 Nullable(String),
     metadata_9 Nullable(String),
     metadata_10 Nullable(String),
-    _timestamp   DateTime DEFAULT now()
+    _timestamp   DateTime           DEFAULT now()
 ) ENGINE = ReplacingMergeTree(_timestamp)
       PARTITION BY toYYYYMMDD(datetime)
       ORDER BY (project_id, datetime, session_id)
       TTL datetime + INTERVAL 1 MONTH
-      SETTINGS index_granularity = 512;
+      SETTINGS index_granularity = 512
+      COMMENT 'full session details with metadata';
 
 CREATE TABLE IF NOT EXISTS autocomplete
 (
-    project_id UInt32 NOT NULL,
-    type LowCardinality(String) NOT NULL,
-    value      String NOT NULL,
+    project_id UInt32,
+    type LowCardinality(String),
+    value      String,
     _timestamp DateTime DEFAULT now()
 ) ENGINE = ReplacingMergeTree(_timestamp)
       PARTITION BY toYYYYMM(_timestamp)
