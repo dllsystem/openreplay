@@ -2,7 +2,6 @@ import math
 
 import schemas
 from chalicelib.utils import pg_client
-from chalicelib.utils import args_transformer
 from chalicelib.utils import helper
 from chalicelib.utils.TimeUTC import TimeUTC
 from chalicelib.utils import ch_client
@@ -861,24 +860,6 @@ def get_network(project_id, startTimestamp=TimeUTC.now(delta_days=-1),
                 i += 1
 
     return {"startTimestamp": startTimestamp, "endTimestamp": endTimestamp, "chart": results}
-
-
-KEYS = {
-    'startTimestamp': args_transformer.int_arg,
-    'endTimestamp': args_transformer.int_arg,
-    'density': args_transformer.int_arg,
-    'performanceDensity': args_transformer.int_arg,
-    'platform': args_transformer.string
-}
-
-
-def dashboard_args(params):
-    args = {}
-    if params is not None:
-        for key in params.keys():
-            if key in KEYS.keys():
-                args[key] = KEYS[key](params.get(key))
-    return args
 
 
 def get_resources_loading_time(project_id, startTimestamp=TimeUTC.now(delta_days=-1),
