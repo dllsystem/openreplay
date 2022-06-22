@@ -1,11 +1,13 @@
 from typing import List
 
 import schemas
+import schemas_ee
 from chalicelib.core import events, metadata, events_ios, \
     sessions_mobs, issues, projects, errors, resources, assist, performance_event
 from chalicelib.utils import pg_client, helper, metrics_helper, ch_client
 
-SESSION_PROJECTION_COLS = """s.project_id,
+SESSION_PROJECTION_COLS = """\
+s.project_id,
 s.session_id::text AS session_id,
 s.user_uuid,
 s.user_id,
@@ -30,24 +32,25 @@ COALESCE((SELECT TRUE
    AND fs.user_id = %(userId)s LIMIT 1), FALSE) AS viewed 
    """
 
-SESSION_PROJECTION_COLS_CH = """s.project_id,
-s.session_id,
-s.user_uuid,
-s.user_id,
-s.user_os,
-s.user_browser,
-s.user_device,
-s.user_device_type,
-s.user_country,
-s.datetime AS start_ts,
-s.duration,
-s.events_count,
-s.pages_count,
-s.errors_count,
-s.user_anonymous_id,
-s.platform
+SESSION_PROJECTION_COLS_CH = """\
+s.project_id,
+s.session_id AS session_id,
+s.user_uuid AS user_uuid,
+s.user_id AS user_id,
+s.user_os AS user_os,
+s.user_browser AS user_browser,
+s.user_device AS user_device,
+s.user_device_type AS user_device_type,
+s.user_country AS user_country,
+toUnixTimestamp(s.datetime)*1000 AS start_ts,
+s.duration AS duration,
+s.events_count AS events_count,
+s.pages_count AS pages_count,
+s.errors_count AS errors_count,
+s.user_anonymous_id AS user_anonymous_id,
+s.platform AS platform,
+0 AS issue_score
 -- ,
--- s.issue_score,
 -- to_jsonb(s.issue_types) AS issue_types,
 -- favorite_sessions.session_id NOTNULL            AS favorite,
 -- COALESCE((SELECT TRUE
@@ -55,6 +58,26 @@ s.platform
 --  WHERE s.session_id = fs.session_id
 --    AND fs.user_id = %(userId)s LIMIT 1), FALSE) AS viewed 
    """
+
+SESSION_PROJECTION_COLS_CH_MAP = """\
+'project_id',        toString(%(project_id)s),
+'session_id',        toString(s.session_id),
+'user_uuid',         toString(s.user_uuid),
+'user_id',           toString(s.user_id),
+'user_os',           toString(s.user_os),
+'user_browser',      toString(s.user_browser),
+'user_device',       toString(s.user_device),
+'user_device_type',  toString(s.user_device_type),
+'user_country',      toString(s.user_country),
+'start_ts',          toString(toUnixTimestamp(s.datetime)*1000),
+'duration',          toString(s.duration),
+'events_count',      toString(s.events_count),
+'pages_count',       toString(s.pages_count),
+'errors_count',      toString(s.errors_count),
+'user_anonymous_id', toString(s.user_anonymous_id),
+'platform',          toString(s.platform),
+'issue_score',       '0'
+"""
 
 
 def __group_metadata(session, project_metadata):
@@ -132,8 +155,10 @@ def get_by_id2_pg(project_id, session_id, user_id, full_data=False, include_fav_
                                                        project_key=data["projectKey"])
             data["inDB"] = True
             return data
-        else:
+        elif live:
             return assist.get_live_session_by_id(project_id=project_id, session_id=session_id)
+        else:
+            return None
 
 
 def __get_sql_operator(op: schemas.SearchEventOperator):
@@ -390,42 +415,14 @@ def search2_ch(data: schemas.SessionsSearchPayloadSchema, project_id, user_id, e
                 sort = helper.key_to_snake_case(data.sort)
 
             meta_keys = metadata.get(project_id=project_id)
-            # main_query = cur.format(f"""SELECT COUNT(full_sessions) AS count,
-            #                                     COALESCE(JSONB_AGG(full_sessions)
-            #                                         FILTER (WHERE rn>%(sessions_limit_s)s AND rn<=%(sessions_limit_e)s), '[]'::JSONB) AS sessions
-            #                                 FROM (SELECT *, ROW_NUMBER() OVER (ORDER BY {sort} {data.order}, issue_score DESC) AS rn
-            #                                 FROM (SELECT DISTINCT ON(s.session_id) {SESSION_PROJECTION_COLS}
-            #                                                     {"," if len(meta_keys) > 0 else ""}{",".join([f'metadata_{m["index"]}' for m in meta_keys])}
-            #                                 {query_part}
-            #                                 ORDER BY s.session_id desc) AS filtred_sessions
-            #                                 ORDER BY {sort} {data.order}, issue_score DESC) AS full_sessions;""",
-            #                          full_args)
-            main_query = cur.format(f"""SELECT COUNT(*) AS total
-                                        {query_part};""", full_args)
-            print("--------------------")
-            print(main_query)
-            print("--------------------")
-            try:
-                total = cur.execute(main_query)
-                if total and len(total) > 0:
-                    total = total[0].get("total", 0)
-                else:
-                    total = 0
-            except Exception as err:
-                print("--------- SESSIONS SEARCH QUERY EXCEPTION -----------")
-                print(main_query)
-                print("--------- PAYLOAD -----------")
-                print(data.json())
-                print("--------------------")
-                raise err
-            if total == 0 or count_only:
-                return {"total": total, "sessions": []}
-            main_query = cur.format(f"""SELECT {SESSION_PROJECTION_COLS_CH}
-                                            {"," if len(meta_keys) > 0 else ""}{",".join([f'metadata_{m["index"]}' for m in meta_keys])}
-                                        {query_part}
-                                        ORDER BY {sort} {data.order}
-                                        LIMIT %(sessions_limit)s OFFSET %(sessions_limit_s)s;""",
-                                    full_args)
+            main_query = cur.format(f"""SELECT any(total) AS count, groupArray(%(sessions_limit)s)(details) AS sessions
+                                        FROM (SELECT COUNT() OVER () AS total,
+                                                    rowNumberInAllBlocks() AS rn,
+                                                    map({SESSION_PROJECTION_COLS_CH_MAP}) AS details
+                                             {query_part}
+--                                              ORDER BY {sort} {data.order}
+                                             ) AS raw
+                                        WHERE rn>%(sessions_limit_s)s AND rn<=%(sessions_limit_e)s;""", full_args)
         print("--------------------")
         print(main_query)
         print("--------------------")
@@ -441,12 +438,15 @@ def search2_ch(data: schemas.SessionsSearchPayloadSchema, project_id, user_id, e
         if errors_only:
             return helper.list_to_camel_case(cur.fetchall())
 
+        if len(sessions) > 0:
+            sessions = sessions[0]
         # if count_only:
         #     return helper.dict_to_camel_case(sessions)
-        for s in sessions:
-            s["session_id"] = str(s["session_id"])
-        # total = sessions["count"]
-        # sessions = sessions["sessions"]
+        # for s in sessions:
+        #     print(s)
+        #     s["session_id"] = str(s["session_id"])
+        total = sessions["count"]
+        sessions = sessions["sessions"]
 
     if data.group_by_user:
         for i, s in enumerate(sessions):
@@ -455,15 +455,17 @@ def search2_ch(data: schemas.SessionsSearchPayloadSchema, project_id, user_id, e
             sessions[i]["metadata"] = {k["key"]: sessions[i][f'metadata_{k["index"]}'] for k in meta_keys \
                                        if sessions[i][f'metadata_{k["index"]}'] is not None}
     else:
-        for i, s in enumerate(sessions):
+        for i in range(len(sessions)):
             sessions[i]["metadata"] = {k["key"]: sessions[i][f'metadata_{k["index"]}'] for k in meta_keys \
-                                       if sessions[i][f'metadata_{k["index"]}'] is not None}
+                                       if sessions[i].get(f'metadata_{k["index"]}') is not None}
+            sessions[i] = schemas_ee.SessionModel.parse_obj(helper.dict_to_camel_case(sessions[i]))
+
     # if not data.group_by_user and data.sort is not None and data.sort != "session_id":
     #     sessions = sorted(sessions, key=lambda s: s[helper.key_to_snake_case(data.sort)],
     #                       reverse=data.order.upper() == "DESC")
     return {
         'total': total,
-        'sessions': helper.list_to_camel_case(sessions)
+        'sessions': sessions
     }
 
 
@@ -1428,10 +1430,11 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
             if __is_valid_event(is_any=is_any, event=event):
                 valid_events_count += 1
         events_query_from = []
+        events_conditions = []
         event_index = 0
         or_events = data.events_order == schemas.SearchEventOrder._or
-        # events_joiner = " FULL JOIN " if or_events else " INNER JOIN LATERAL "
-        events_joiner = " UNION " if or_events else " INNER JOIN LATERAL "
+        # events_joiner = " UNION " if or_events else " INNER JOIN LATERAL "
+        events_joiner = " UNION " if or_events else " INNER JOIN "
         for i, event in enumerate(data.events):
             event_type = event.type
             is_any = _isAny_opreator(event.operator)
@@ -1444,22 +1447,22 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
             if __is_negation_operator(event.operator):
                 is_not = True
                 op = __reverse_sql_operator(op)
-            if event_index == 0 or or_events:
-                # event_from = "%s INNER JOIN final.sessions AS ms USING (session_id)"
-                event_from = "%s"
-                event_where = ["main.project_id = %(projectId)s",
-                               "main.datetime >= toDateTime(%(startDate)s/1000)",
-                               "main.datetime <= toDateTime(%(endDate)s/1000)"]
-                if favorite_only and not errors_only:
-                    event_from += "INNER JOIN final.user_favorite_sessions AS fs USING(session_id)"
-                    event_where.append("fs.user_id = %(userId)s")
-            else:
-                event_from = "%s"
-                event_where = ["main.datetime >= toDateTime(%(startDate)s/1000)",
-                               "main.datetime <= toDateTime(%(endDate)s/1000)",
-                               "main.session_id=event_0.session_id"]
-                if data.events_order == schemas.SearchEventOrder._then:
-                    event_where.append(f"event_{event_index - 1}.datetime <= main.datetime")
+            # if event_index == 0 or or_events:
+            # event_from = "%s INNER JOIN final.sessions AS ms USING (session_id)"
+            event_from = "%s"
+            event_where = ["main.project_id = %(projectId)s",
+                           "main.datetime >= toDateTime(%(startDate)s/1000)",
+                           "main.datetime <= toDateTime(%(endDate)s/1000)"]
+            if favorite_only and not errors_only:
+                event_from += "INNER JOIN final.user_favorite_sessions AS fs USING(session_id)"
+                event_where.append("fs.user_id = %(userId)s")
+            # else:
+            #     event_from = "%s"
+            #     event_where = ["main.datetime >= toDateTime(%(startDate)s/1000)",
+            #                    "main.datetime <= toDateTime(%(endDate)s/1000)",
+            #                    "main.session_id=event_0.session_id"]
+            #     if data.events_order == schemas.SearchEventOrder._then:
+            #         event_where.append(f"event_{event_index - 1}.datetime <= main.datetime")
             e_k = f"e_value{i}"
             s_k = e_k + "_source"
             if event.type != schemas.PerformanceEventType.time_between_events:
@@ -1471,13 +1474,16 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
             if event_type == events.event_type.CLICK.ui_type:
                 event_from = event_from % f"final.events AS main "
                 event_where.append(f"main.event_type='CLICK'")
+                events_conditions.append({"type": event_where[-1]})
                 if not is_any:
                     event_where.append(
                         _multiple_conditions(f"main.{events.event_type.CLICK.column} {op} %({e_k})s", event.value,
                                              value_key=e_k))
+                    events_conditions[-1]["condition"] = event_where[-1]
 
             elif event_type == events.event_type.INPUT.ui_type:
-                event_from = event_from % f"{events.event_type.INPUT.table} AS main "
+                event_from = event_from % f"final.events AS main "
+                event_where.append(f"main.event_type='INPUT'")
                 if not is_any:
                     event_where.append(
                         _multiple_conditions(f"main.{events.event_type.INPUT.column} {op} %({e_k})s", event.value,
@@ -1488,19 +1494,24 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                     full_args = {**full_args, **_multiple_values(event.source, value_key=f"custom{i}")}
 
             elif event_type == events.event_type.LOCATION.ui_type:
-                event_from = event_from % f"{events.event_type.LOCATION.table} AS main "
+                event_from = event_from % f"final.events AS main "
+                event_where.append(f"main.event_type='PAGE'")
+                events_conditions.append({"type": event_where[-1]})
                 if not is_any:
                     event_where.append(
                         _multiple_conditions(f"main.{events.event_type.LOCATION.column} {op} %({e_k})s",
                                              event.value, value_key=e_k))
+                    events_conditions[-1]["condition"] = event_where[-1]
             elif event_type == events.event_type.CUSTOM.ui_type:
-                event_from = event_from % f"{events.event_type.CUSTOM.table} AS main "
+                event_from = event_from % f"final.events AS main "
+                event_where.append(f"main.event_type='CUSTOM'")
                 if not is_any:
                     event_where.append(
                         _multiple_conditions(f"main.{events.event_type.CUSTOM.column} {op} %({e_k})s", event.value,
                                              value_key=e_k))
             elif event_type == events.event_type.REQUEST.ui_type:
-                event_from = event_from % f"{events.event_type.REQUEST.table} AS main "
+                event_from = event_from % f"final.events AS main "
+                event_where.append(f"main.event_type='REQUEST'")
                 if not is_any:
                     event_where.append(
                         _multiple_conditions(f"main.{events.event_type.REQUEST.column} {op} %({e_k})s", event.value,
@@ -1710,7 +1721,10 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
             ) AS event_{event_index} {"ON(TRUE)" if event_index > 0 else ""}\
             """)
             else:
-                events_query_from.append(f"""\
+                if data.events_order == schemas.SearchEventOrder._then:
+                    pass
+                else:
+                    events_query_from.append(f"""\
             (SELECT main.session_id, {"MIN" if event_index < (valid_events_count - 1) else "MAX"}(main.datetime) AS datetime
               FROM {event_from}
               WHERE {" AND ".join(event_where)}
@@ -1727,7 +1741,24 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                                         FROM ({events_joiner.join(events_query_from)}) AS u
                                         GROUP BY 1"""
             else:
-                events_query_part = f"""SELECT
+                if data.events_order == schemas.SearchEventOrder._then:
+                    events_conditions_where = ["main.project_id = %(projectId)s",
+                                               "main.datetime >= toDateTime(%(startDate)s/1000)",
+                                               "main.datetime <= toDateTime(%(endDate)s/1000)"]
+                    events_conditions_where.append(f"({' OR '.join([c['type'] for c in events_conditions])})")
+                    events_conditions_where.append(f"({' OR '.join([c['condition'] for c in events_conditions])})")
+                    having = f"""HAVING sequenceMatch('{''.join([f'(?{i + 1})' for i in range(len(events_conditions))])}')\
+                                        (main.datetime,{','.join([f'{c["type"]} AND {c["condition"]}' for c in events_conditions])})""" \
+                        if event_index > 1 else ""
+                    events_query_part = f"""SELECT main.session_id,
+                                                MIN(main.datetime) AS first_event_ts,
+                                                MAX(main.datetime) AS last_event_ts
+                                            FROM final.events AS main
+                                            WHERE {" AND ".join(events_conditions_where)}
+                                            GROUP BY session_id
+                                            {having}"""
+                else:
+                    events_query_part = f"""SELECT
                                         event_0.session_id,
                                         MIN(event_0.datetime) AS first_event_ts,
                                         MAX(event_{event_index - 1}.datetime) AS last_event_ts
@@ -1784,13 +1815,15 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
         extra_join += f"""INNER JOIN {extra_event} AS ev USING(session_id)"""
         extra_constraints.append("ev.timestamp>=%(startDate)s")
         extra_constraints.append("ev.timestamp<=%(endDate)s")
+    extra_join += f"""INNER JOIN (SELECT * 
+                                FROM final.sessions AS s 
+                                WHERE {" AND ".join(extra_constraints)}) AS s ON(s.session_id=f.session_id)""" \
+        if len(events_query_part) > 0 else ""
     query_part = f"""\
                         FROM {f"({events_query_part}) AS f" if len(events_query_part) > 0 else "final.sessions AS s"}
                         {extra_join}
-                        {"INNER JOIN final.sessions AS s ON(s.session_id=f.session_id)" if len(events_query_part) > 0 else ""}
                         {extra_from}
-                        WHERE 
-                          {" AND ".join(extra_constraints)}"""
+                        """
     return full_args, query_part
 
 

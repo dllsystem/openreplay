@@ -56,8 +56,8 @@ CREATE TABLE IF NOT EXISTS events_s
     container_name Nullable(String),
     container_src Nullable(String),
     url Nullable(String),
-    url_host Nullable(String)                      MATERIALIZED lower(domain(url)),
-    url_path Nullable(String)                      MATERIALIZED lower(pathFull(url)),
+    host Nullable(String)                          MATERIALIZED lower(domain(url)),
+    path Nullable(String)                          MATERIALIZED lower(pathFull(url)),
     request_start Nullable(UInt16),
     response_start Nullable(UInt16),
     response_end Nullable(UInt16),
@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS events_s
     _timestamp                                     DateTime DEFAULT now()
 ) ENGINE = MergeTree
       PARTITION BY toYYYYMM(datetime)
-      ORDER BY (project_id, datetime, event_type, session_id)
+      ORDER BY (project_id, datetime, event_type, session_id,seq_idx)
       TTL datetime + INTERVAL 1 MONTH
       COMMENT 'All events';
 
