@@ -1732,38 +1732,43 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
             ) {"" if or_events else (f"AS event_{event_index} " + ("ON(TRUE)" if event_index > 0 else ""))}\
             """)
             event_index += 1
-        if event_index > 0:
-            if or_events:
-                events_query_part = f"""SELECT
-                                            session_id, 
-                                            MIN(datetime) AS first_event_ts, 
-                                            MAX(datetime) AS last_event_ts
-                                        FROM ({events_joiner.join(events_query_from)}) AS u
-                                        GROUP BY 1"""
-            else:
-                if data.events_order == schemas.SearchEventOrder._then:
-                    events_conditions_where = ["main.project_id = %(projectId)s",
-                                               "main.datetime >= toDateTime(%(startDate)s/1000)",
-                                               "main.datetime <= toDateTime(%(endDate)s/1000)"]
-                    events_conditions_where.append(f"({' OR '.join([c['type'] for c in events_conditions])})")
-                    events_conditions_where.append(f"({' OR '.join([c['condition'] for c in events_conditions])})")
-                    having = f"""HAVING sequenceMatch('{''.join([f'(?{i + 1})' for i in range(len(events_conditions))])}')\
-                                        (main.datetime,{','.join([f'{c["type"]} AND {c["condition"]}' for c in events_conditions])})""" \
-                        if event_index > 1 else ""
-                    events_query_part = f"""SELECT main.session_id,
-                                                MIN(main.datetime) AS first_event_ts,
-                                                MAX(main.datetime) AS last_event_ts
-                                            FROM final.events AS main
-                                            WHERE {" AND ".join(events_conditions_where)}
-                                            GROUP BY session_id
-                                            {having}"""
-                else:
-                    events_query_part = f"""SELECT
-                                        event_0.session_id,
-                                        MIN(event_0.datetime) AS first_event_ts,
-                                        MAX(event_{event_index - 1}.datetime) AS last_event_ts
-                                    FROM {events_joiner.join(events_query_from)}
+
+        events_conditions_where = ["main.project_id = %(projectId)s",
+                                   "main.datetime >= toDateTime(%(startDate)s/1000)",
+                                   "main.datetime <= toDateTime(%(endDate)s/1000)"]
+        if data.events_order == schemas.SearchEventOrder._then:
+            events_conditions_where.append(f"({' OR '.join([c['type'] for c in events_conditions])})")
+            events_conditions_where.append(f"({' OR '.join([c['condition'] for c in events_conditions])})")
+            having = ""
+            events_conditions = [c['type'] + ' AND ' + c['condition'] for c in events_conditions]
+            if event_index > 1:
+                having = f"""HAVING sequenceMatch('{''.join([f'(?{i + 1})' for i in range(len(events_conditions))])}')\
+                                (main.datetime,{','.join(events_conditions)})"""
+
+            events_query_part = f"""SELECT main.session_id,
+                                        MIN(main.datetime) AS first_event_ts,
+                                        MAX(main.datetime) AS last_event_ts
+                                    FROM final.events AS main
+                                    WHERE {" AND ".join(events_conditions_where)}
+                                    GROUP BY session_id
+                                    {having}"""
+        elif data.events_order == schemas.SearchEventOrder._or:
+            events_conditions_where.append(f"({' OR '.join([c['type'] for c in events_conditions])})")
+            events_conditions = [c['type'] + ' AND ' + c['condition'] for c in events_conditions]
+            events_conditions_where.append(f"({' OR '.join(events_conditions)})")
+            events_query_part = f"""SELECT main.session_id,
+                                        MIN(main.datetime) AS first_event_ts,
+                                        MAX(main.datetime) AS last_event_ts
+                                    FROM final.events AS main
+                                    WHERE {" AND ".join(events_conditions_where)}
                                     GROUP BY session_id"""
+        else:
+            events_query_part = f"""SELECT
+                                event_0.session_id,
+                                MIN(event_0.datetime) AS first_event_ts,
+                                MAX(event_{event_index - 1}.datetime) AS last_event_ts
+                            FROM {events_joiner.join(events_query_from)}
+                            GROUP BY session_id"""
     else:
         data.events = []
     # ---------------------------------------------------------------------------
