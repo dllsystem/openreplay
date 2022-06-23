@@ -1746,7 +1746,7 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                 having = f"""HAVING sequenceMatch('{''.join([f'(?{i + 1})' for i in range(len(events_conditions))])}')\
                                 (main.datetime,{','.join(events_conditions)})"""
             else:
-                having = f"""HAVING {" AND ".join([f"sum(if({c},1,0))>0" for c in events_conditions])}"""
+                having = f"""HAVING {" AND ".join([f"countIf({c})>0" for c in events_conditions])}"""
 
             events_query_part = f"""SELECT main.session_id,
                                         MIN(main.datetime) AS first_event_ts,
