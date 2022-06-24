@@ -15,6 +15,18 @@ CREATE TABLE IF NOT EXISTS user_favorite_sessions
       SETTINGS index_granularity = 512
       COMMENT 'users favorite sessions';
 
+CREATE TABLE IF NOT EXISTS user_viewed_sessions
+(
+    user_id    UInt16,
+    session_id UInt64,
+    _timestamp DateTime DEFAULT now()
+) ENGINE = ReplacingMergeTree(_timestamp)
+      PARTITION BY toYYYYMM(_timestamp)
+      ORDER BY (user_id, session_id)
+      TTL _timestamp + INTERVAL 1 MONTH
+      SETTINGS index_granularity = 512
+      COMMENT 'users viewed sessions';
+
 CREATE TABLE projects_metadata
 (
     project_id UInt32,
