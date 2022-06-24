@@ -1216,8 +1216,18 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
         "s.project_id = %(project_id)s",
         "isNotNull(s.duration)"
     ]
+    if favorite_only:
+        extra_constraints.append("""s.session_id IN (SELECT session_id
+                                                        FROM final.user_favorite_sessions
+                                                        WHERE user_id = %(userId)s)""")
     extra_from = ""
     events_query_part = ""
+    __events_where_basic = ["project_id = %(projectId)s",
+                            "datetime >= toDateTime(%(startDate)s/1000)",
+                            "datetime <= toDateTime(%(endDate)s/1000)"]
+    events_conditions_where = ["main.project_id = %(projectId)s",
+                               "main.datetime >= toDateTime(%(startDate)s/1000)",
+                               "main.datetime <= toDateTime(%(endDate)s/1000)"]
     if len(data.filters) > 0:
         meta_keys = None
         for i, f in enumerate(data.filters):
@@ -1248,8 +1258,8 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
 
             elif filter_type in [schemas.FilterType.user_os, schemas.FilterType.user_os_ios]:
                 if is_any:
-                    extra_constraints.append('s.user_os IS NOT NULL')
-                    ss_constraints.append('ms.user_os IS NOT NULL')
+                    extra_constraints.append('isNotNull(s.user_os)')
+                    ss_constraints.append('isNotNull(ms.user_os)')
                 else:
                     extra_constraints.append(
                         _multiple_conditions(f's.user_os {op} %({f_k})s', f.value, is_not=is_not, value_key=f_k))
@@ -1258,8 +1268,8 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
 
             elif filter_type in [schemas.FilterType.user_device, schemas.FilterType.user_device_ios]:
                 if is_any:
-                    extra_constraints.append('s.user_device IS NOT NULL')
-                    ss_constraints.append('ms.user_device IS NOT NULL')
+                    extra_constraints.append('isNotNull(s.user_device)')
+                    ss_constraints.append('isNotNull(ms.user_device)')
                 else:
                     extra_constraints.append(
                         _multiple_conditions(f's.user_device {op} %({f_k})s', f.value, is_not=is_not, value_key=f_k))
@@ -1268,8 +1278,8 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
 
             elif filter_type in [schemas.FilterType.user_country, schemas.FilterType.user_country_ios]:
                 if is_any:
-                    extra_constraints.append('s.user_country IS NOT NULL')
-                    ss_constraints.append('ms.user_country IS NOT NULL')
+                    extra_constraints.append('isNotNull(s.user_country)')
+                    ss_constraints.append('isNotNull(ms.user_country)')
                 else:
                     extra_constraints.append(
                         _multiple_conditions(f's.user_country {op} %({f_k})s', f.value, is_not=is_not, value_key=f_k))
@@ -1278,8 +1288,8 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
 
             elif filter_type in [schemas.FilterType.utm_source]:
                 if is_any:
-                    extra_constraints.append('s.utm_source IS NOT NULL')
-                    ss_constraints.append('ms.utm_source  IS NOT NULL')
+                    extra_constraints.append('isNotNull(s.utm_source)')
+                    ss_constraints.append('isNotNull(ms.utm_source)')
                 elif is_undefined:
                     extra_constraints.append('s.utm_source IS NULL')
                     ss_constraints.append('ms.utm_source  IS NULL')
@@ -1292,11 +1302,11 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                                              value_key=f_k))
             elif filter_type in [schemas.FilterType.utm_medium]:
                 if is_any:
-                    extra_constraints.append('s.utm_medium IS NOT NULL')
-                    ss_constraints.append('ms.utm_medium IS NOT NULL')
+                    extra_constraints.append('isNotNull(s.utm_medium)')
+                    ss_constraints.append('isNotNull(ms.utm_medium)')
                 elif is_undefined:
-                    extra_constraints.append('s.utm_medium IS NULL')
-                    ss_constraints.append('ms.utm_medium IS NULL')
+                    extra_constraints.append('isNull(s.utm_medium)')
+                    ss_constraints.append('isNull(ms.utm_medium')
                 else:
                     extra_constraints.append(
                         _multiple_conditions(f's.utm_medium {op} %({f_k})s::text', f.value, is_not=is_not,
@@ -1306,11 +1316,11 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                                              value_key=f_k))
             elif filter_type in [schemas.FilterType.utm_campaign]:
                 if is_any:
-                    extra_constraints.append('s.utm_campaign IS NOT NULL')
-                    ss_constraints.append('ms.utm_campaign IS NOT NULL')
+                    extra_constraints.append('isNotNull(s.utm_campaign)')
+                    ss_constraints.append('isNotNull(ms.utm_campaign)')
                 elif is_undefined:
-                    extra_constraints.append('s.utm_campaign IS NULL')
-                    ss_constraints.append('ms.utm_campaign IS NULL')
+                    extra_constraints.append('isNull(s.utm_campaign)')
+                    ss_constraints.append('isNull(ms.utm_campaign)')
                 else:
                     extra_constraints.append(
                         _multiple_conditions(f's.utm_campaign {op} %({f_k})s::text', f.value, is_not=is_not,
@@ -1329,12 +1339,17 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                     ss_constraints.append("ms.duration <= %(maxDuration)s")
                     full_args["maxDuration"] = f.value[1]
             elif filter_type == schemas.FilterType.referrer:
-                extra_from += f"INNER JOIN {events.event_type.LOCATION.table} AS p USING(session_id)"
+                # extra_from += f"INNER JOIN {events.event_type.LOCATION.table} AS p USING(session_id)"
                 if is_any:
-                    extra_constraints.append('p.base_referrer IS NOT NULL')
+                    referrer_constraint = 'isNotNull(r.base_referrer)'
                 else:
-                    extra_constraints.append(
-                        _multiple_conditions(f"p.base_referrer {op} %({f_k})s", f.value, is_not=is_not, value_key=f_k))
+                    referrer_constraint = _multiple_conditions(f"r.base_referrer {op} %({f_k})s", f.value,
+                                                               is_not=is_not, value_key=f_k)
+                events_conditions_where.append(f"""main.session_id IN (SELECT session_id
+                                                  FROM final.events AS r
+                                                  WHERE {" AND ".join([f"r.{b}" for b in __events_where_basic])}
+                                                    AND event_type='PAGE'
+                                                    AND {referrer_constraint})""")
             elif filter_type == events.event_type.METADATA.ui_type:
                 # get metadata list only if you need it
                 if meta_keys is None:
@@ -1734,9 +1749,6 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
             """)
             event_index += 1
 
-        events_conditions_where = ["main.project_id = %(projectId)s",
-                                   "main.datetime >= toDateTime(%(startDate)s/1000)",
-                                   "main.datetime <= toDateTime(%(endDate)s/1000)"]
         if event_index < 2:
             data.events_order = schemas.SearchEventOrder._or
         if favorite_only and user_id is not None:
@@ -1819,12 +1831,16 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
         extra_join += f"""INNER JOIN {extra_event} AS ev USING(session_id)"""
         extra_constraints.append("ev.timestamp>=%(startDate)s")
         extra_constraints.append("ev.timestamp<=%(endDate)s")
-    extra_join += f"""INNER JOIN (SELECT * 
+    if len(events_query_part) > 0:
+        extra_join += f"""INNER JOIN (SELECT * 
                                 FROM final.sessions AS s 
-                                WHERE {" AND ".join(extra_constraints)}) AS s ON(s.session_id=f.session_id)""" \
-        if len(events_query_part) > 0 else ""
+                                WHERE {" AND ".join(extra_constraints)}) AS s ON(s.session_id=f.session_id)"""
+    else:
+        extra_join += f"""(SELECT * 
+                            FROM final.sessions AS s 
+                            WHERE {" AND ".join(extra_constraints)}) AS s"""
     query_part = f"""\
-                        FROM {f"({events_query_part}) AS f" if len(events_query_part) > 0 else "final.sessions AS s"}
+                        FROM {f"({events_query_part}) AS f" if len(events_query_part) > 0 else ""}
                         {extra_join}
                         {extra_from}
                         """
