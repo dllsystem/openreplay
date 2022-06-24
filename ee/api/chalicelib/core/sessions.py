@@ -49,10 +49,10 @@ s.pages_count AS pages_count,
 s.errors_count AS errors_count,
 s.user_anonymous_id AS user_anonymous_id,
 s.platform AS platform,
-0 AS issue_score
+0 AS issue_score,
 -- ,
 -- to_jsonb(s.issue_types) AS issue_types,
--- favorite_sessions.session_id NOTNULL            AS favorite,
+isNotNull(favorite_sessions.session_id) AS favorite,
 -- COALESCE((SELECT TRUE
 --  FROM public.user_viewed_sessions AS fs
 --  WHERE s.session_id = fs.session_id
@@ -76,7 +76,8 @@ SESSION_PROJECTION_COLS_CH_MAP = """\
 'errors_count',      toString(s.errors_count),
 'user_anonymous_id', toString(s.user_anonymous_id),
 'platform',          toString(s.platform),
-'issue_score',       '0'
+'issue_score',       '0',
+'favorite',          toString(isNotNull(favorite_sessions.session_id))
 """
 
 
@@ -1213,7 +1214,7 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                  "projectId": project_id, "userId": user_id}
     extra_constraints = [
         "s.project_id = %(project_id)s",
-        "s.duration IS NOT NULL"
+        "isNotNull(s.duration)"
     ]
     extra_from = ""
     events_query_part = ""
