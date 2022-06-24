@@ -1230,6 +1230,8 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                                "main.datetime <= toDateTime(%(endDate)s/1000)"]
     if len(data.filters) > 0:
         meta_keys = None
+        # to reduce include a sub-query of sessions inside events query, in order to reduce the selected data
+        include_in_events = False
         for i, f in enumerate(data.filters):
             if not isinstance(f.value, list):
                 f.value = [f.value]
@@ -1295,10 +1297,10 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                     ss_constraints.append('isNull(ms.utm_source)')
                 else:
                     extra_constraints.append(
-                        _multiple_conditions(f's.utm_source {op} %({f_k})s::text', f.value, is_not=is_not,
+                        _multiple_conditions(f's.utm_source {op} toString(%({f_k})s)', f.value, is_not=is_not,
                                              value_key=f_k))
                     ss_constraints.append(
-                        _multiple_conditions(f'ms.utm_source {op} %({f_k})s::text', f.value, is_not=is_not,
+                        _multiple_conditions(f'ms.utm_source {op} toString(%({f_k})s)', f.value, is_not=is_not,
                                              value_key=f_k))
             elif filter_type in [schemas.FilterType.utm_medium]:
                 if is_any:
@@ -1309,10 +1311,10 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                     ss_constraints.append('isNull(ms.utm_medium')
                 else:
                     extra_constraints.append(
-                        _multiple_conditions(f's.utm_medium {op} %({f_k})s::text', f.value, is_not=is_not,
+                        _multiple_conditions(f's.utm_medium {op} toString(%({f_k})s)', f.value, is_not=is_not,
                                              value_key=f_k))
                     ss_constraints.append(
-                        _multiple_conditions(f'ms.utm_medium {op} %({f_k})s::text', f.value, is_not=is_not,
+                        _multiple_conditions(f'ms.utm_medium {op} toString(%({f_k})s)', f.value, is_not=is_not,
                                              value_key=f_k))
             elif filter_type in [schemas.FilterType.utm_campaign]:
                 if is_any:
@@ -1323,10 +1325,10 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                     ss_constraints.append('isNull(ms.utm_campaign)')
                 else:
                     extra_constraints.append(
-                        _multiple_conditions(f's.utm_campaign {op} %({f_k})s::text', f.value, is_not=is_not,
+                        _multiple_conditions(f's.utm_campaign {op} toString(%({f_k})s)', f.value, is_not=is_not,
                                              value_key=f_k))
                     ss_constraints.append(
-                        _multiple_conditions(f'ms.utm_campaign {op} %({f_k})s::text', f.value, is_not=is_not,
+                        _multiple_conditions(f'ms.utm_campaign {op} toString(%({f_k})s)', f.value, is_not=is_not,
                                              value_key=f_k))
 
             elif filter_type == schemas.FilterType.duration:
@@ -1368,11 +1370,11 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                     else:
                         extra_constraints.append(
                             _multiple_conditions(
-                                f"s.{metadata.index_to_colname(meta_keys[f.source])} {op} %({f_k})s::text",
+                                f"s.{metadata.index_to_colname(meta_keys[f.source])} {op} toString(%({f_k})s)",
                                 f.value, is_not=is_not, value_key=f_k))
                         ss_constraints.append(
                             _multiple_conditions(
-                                f"ms.{metadata.index_to_colname(meta_keys[f.source])} {op} %({f_k})s::text",
+                                f"ms.{metadata.index_to_colname(meta_keys[f.source])} {op} toString(%({f_k})s)",
                                 f.value, is_not=is_not, value_key=f_k))
             elif filter_type in [schemas.FilterType.user_id, schemas.FilterType.user_id_ios]:
                 if is_any:
@@ -1383,9 +1385,11 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                     ss_constraints.append('isNull(ms.user_id)')
                 else:
                     extra_constraints.append(
-                        _multiple_conditions(f"s.user_id {op} %({f_k})s::text", f.value, is_not=is_not, value_key=f_k))
+                        _multiple_conditions(f"s.user_id {op} toString(%({f_k})s)", f.value, is_not=is_not,
+                                             value_key=f_k))
                     ss_constraints.append(
-                        _multiple_conditions(f"ms.user_id {op} %({f_k})s::text", f.value, is_not=is_not, value_key=f_k))
+                        _multiple_conditions(f"ms.user_id {op} toString(%({f_k})s)", f.value, is_not=is_not,
+                                             value_key=f_k))
             elif filter_type in [schemas.FilterType.user_anonymous_id,
                                  schemas.FilterType.user_anonymous_id_ios]:
                 if is_any:
@@ -1396,10 +1400,10 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                     ss_constraints.append('isNull(ms.user_anonymous_id)')
                 else:
                     extra_constraints.append(
-                        _multiple_conditions(f"s.user_anonymous_id {op} %({f_k})s::text", f.value, is_not=is_not,
+                        _multiple_conditions(f"s.user_anonymous_id {op} toString(%({f_k})s)", f.value, is_not=is_not,
                                              value_key=f_k))
                     ss_constraints.append(
-                        _multiple_conditions(f"ms.user_anonymous_id {op} %({f_k})s::text", f.value, is_not=is_not,
+                        _multiple_conditions(f"ms.user_anonymous_id {op} toString(%({f_k})s)", f.value, is_not=is_not,
                                              value_key=f_k))
             elif filter_type in [schemas.FilterType.rev_id, schemas.FilterType.rev_id_ios]:
                 if is_any:
@@ -1410,9 +1414,11 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                     ss_constraints.append('isNull(ms.rev_id)')
                 else:
                     extra_constraints.append(
-                        _multiple_conditions(f"s.rev_id {op} %({f_k})s::text", f.value, is_not=is_not, value_key=f_k))
+                        _multiple_conditions(f"s.rev_id {op} toString(%({f_k})s)", f.value, is_not=is_not,
+                                             value_key=f_k))
                     ss_constraints.append(
-                        _multiple_conditions(f"ms.rev_id {op} %({f_k})s::text", f.value, is_not=is_not, value_key=f_k))
+                        _multiple_conditions(f"ms.rev_id {op} toString(%({f_k})s)", f.value, is_not=is_not,
+                                             value_key=f_k))
             elif filter_type == schemas.FilterType.platform:
                 # op = __get_sql_operator(f.operator)
                 extra_constraints.append(
@@ -1439,6 +1445,14 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                 ss_constraints.append(
                     _multiple_conditions(f"ms.events_count {op} %({f_k})s", f.value, is_not=is_not,
                                          value_key=f_k))
+            else:
+                continue
+            include_in_events = True
+
+        if include_in_events:
+            events_conditions_where.append(f"""main.session_id IN (SELECT s.session_id 
+                                                FROM final.sessions AS s
+                                                WHERE {" AND ".join(extra_constraints)})""")
     # ---------------------------------------------------------------------------
     if len(data.events) > 0:
         valid_events_count = 0
