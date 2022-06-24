@@ -1248,8 +1248,8 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                 is_not = True
             if filter_type == schemas.FilterType.user_browser:
                 if is_any:
-                    extra_constraints.append('s.user_browser IS NOT NULL')
-                    ss_constraints.append('ms.user_browser IS NOT NULL')
+                    extra_constraints.append('isNotNull(s.user_browser)')
+                    ss_constraints.append('isNotNull(ms.user_browser)')
                 else:
                     extra_constraints.append(
                         _multiple_conditions(f's.user_browser {op} %({f_k})s', f.value, is_not=is_not, value_key=f_k))
@@ -1291,8 +1291,8 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                     extra_constraints.append('isNotNull(s.utm_source)')
                     ss_constraints.append('isNotNull(ms.utm_source)')
                 elif is_undefined:
-                    extra_constraints.append('s.utm_source IS NULL')
-                    ss_constraints.append('ms.utm_source  IS NULL')
+                    extra_constraints.append('isNull(s.utm_source)')
+                    ss_constraints.append('isNull(ms.utm_source)')
                 else:
                     extra_constraints.append(
                         _multiple_conditions(f's.utm_source {op} %({f_k})s::text', f.value, is_not=is_not,
@@ -1345,11 +1345,14 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                 else:
                     referrer_constraint = _multiple_conditions(f"r.base_referrer {op} %({f_k})s", f.value,
                                                                is_not=is_not, value_key=f_k)
-                events_conditions_where.append(f"""main.session_id IN (SELECT session_id
+                referrer_constraint = f"""(SELECT DISTINCT session_id
                                                   FROM final.events AS r
                                                   WHERE {" AND ".join([f"r.{b}" for b in __events_where_basic])}
                                                     AND event_type='PAGE'
-                                                    AND {referrer_constraint})""")
+                                                    AND {referrer_constraint})"""
+                # events_conditions_where.append(f"""main.session_id IN {referrer_constraint}""")
+                # extra_constraints.append(f"""s.session_id IN {referrer_constraint}""")
+                extra_from += f"\nINNER JOIN {referrer_constraint} AS referred ON(referred.session_id=s.session_id)"
             elif filter_type == events.event_type.METADATA.ui_type:
                 # get metadata list only if you need it
                 if meta_keys is None:
@@ -1357,11 +1360,11 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                     meta_keys = {m["key"]: m["index"] for m in meta_keys}
                 if f.source in meta_keys.keys():
                     if is_any:
-                        extra_constraints.append(f"s.{metadata.index_to_colname(meta_keys[f.source])} IS NOT NULL")
-                        ss_constraints.append(f"ms.{metadata.index_to_colname(meta_keys[f.source])} IS NOT NULL")
+                        extra_constraints.append(f"isNotNull(s.{metadata.index_to_colname(meta_keys[f.source])})")
+                        ss_constraints.append(f"isNotNull(ms.{metadata.index_to_colname(meta_keys[f.source])})")
                     elif is_undefined:
-                        extra_constraints.append(f"s.{metadata.index_to_colname(meta_keys[f.source])} IS NULL")
-                        ss_constraints.append(f"ms.{metadata.index_to_colname(meta_keys[f.source])} IS NULL")
+                        extra_constraints.append(f"isNull(s.{metadata.index_to_colname(meta_keys[f.source])})")
+                        ss_constraints.append(f"isNull(ms.{metadata.index_to_colname(meta_keys[f.source])})")
                     else:
                         extra_constraints.append(
                             _multiple_conditions(
@@ -1373,11 +1376,11 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                                 f.value, is_not=is_not, value_key=f_k))
             elif filter_type in [schemas.FilterType.user_id, schemas.FilterType.user_id_ios]:
                 if is_any:
-                    extra_constraints.append('s.user_id IS NOT NULL')
-                    ss_constraints.append('ms.user_id IS NOT NULL')
+                    extra_constraints.append('isNotNull(s.user_id)')
+                    ss_constraints.append('isNotNull(ms.user_id)')
                 elif is_undefined:
-                    extra_constraints.append('s.user_id IS NULL')
-                    ss_constraints.append('ms.user_id IS NULL')
+                    extra_constraints.append('isNull(s.user_id)')
+                    ss_constraints.append('isNull(ms.user_id)')
                 else:
                     extra_constraints.append(
                         _multiple_conditions(f"s.user_id {op} %({f_k})s::text", f.value, is_not=is_not, value_key=f_k))
@@ -1386,11 +1389,11 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
             elif filter_type in [schemas.FilterType.user_anonymous_id,
                                  schemas.FilterType.user_anonymous_id_ios]:
                 if is_any:
-                    extra_constraints.append('s.user_anonymous_id IS NOT NULL')
-                    ss_constraints.append('ms.user_anonymous_id IS NOT NULL')
+                    extra_constraints.append('isNotNull(s.user_anonymous_id)')
+                    ss_constraints.append('isNotNull(ms.user_anonymous_id)')
                 elif is_undefined:
-                    extra_constraints.append('s.user_anonymous_id IS NULL')
-                    ss_constraints.append('ms.user_anonymous_id IS NULL')
+                    extra_constraints.append('isNull(s.user_anonymous_id)')
+                    ss_constraints.append('isNull(ms.user_anonymous_id)')
                 else:
                     extra_constraints.append(
                         _multiple_conditions(f"s.user_anonymous_id {op} %({f_k})s::text", f.value, is_not=is_not,
@@ -1400,11 +1403,11 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                                              value_key=f_k))
             elif filter_type in [schemas.FilterType.rev_id, schemas.FilterType.rev_id_ios]:
                 if is_any:
-                    extra_constraints.append('s.rev_id IS NOT NULL')
-                    ss_constraints.append('ms.rev_id IS NOT NULL')
+                    extra_constraints.append('isNotNull(s.rev_id)')
+                    ss_constraints.append('isNotNull(ms.rev_id)')
                 elif is_undefined:
-                    extra_constraints.append('s.rev_id IS NULL')
-                    ss_constraints.append('ms.rev_id IS NULL')
+                    extra_constraints.append('isNull(s.rev_id)')
+                    ss_constraints.append('isNull(ms.rev_id)')
                 else:
                     extra_constraints.append(
                         _multiple_conditions(f"s.rev_id {op} %({f_k})s::text", f.value, is_not=is_not, value_key=f_k))
