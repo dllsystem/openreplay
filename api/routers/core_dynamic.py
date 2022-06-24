@@ -182,3 +182,10 @@ def get_limits(context: schemas.CurrentContext = Depends(OR_context)):
             },
         }
     }
+
+
+@app.post('/{projectId}/sessions/search2', tags=["sessions"])
+def sessions_search2(projectId: int, data: schemas.FlatSessionsSearchPayloadSchema = Body(...),
+                     context: schemas.CurrentContext = Depends(OR_context)):
+    data = sessions.search2_pg(data=data, project_id=projectId, user_id=context.user_id)
+    return {'data': data}

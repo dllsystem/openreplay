@@ -1739,6 +1739,10 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
                                    "main.datetime <= toDateTime(%(endDate)s/1000)"]
         if event_index < 2:
             data.events_order = schemas.SearchEventOrder._or
+        if favorite_only and user_id is not None:
+            events_conditions_where.append("""main.session_id IN (SELECT session_id
+                                                        FROM final.user_favorite_sessions
+                                                        WHERE user_id = %(userId)s)""")
         if data.events_order in [schemas.SearchEventOrder._then, schemas.SearchEventOrder._and]:
             events_conditions_where.append(f"({' OR '.join([c['type'] for c in events_conditions])})")
             events_conditions_where.append(f"({' OR '.join([c['condition'] for c in events_conditions])})")
@@ -1792,10 +1796,8 @@ def search_query_parts_ch(data, error_status, errors_only, favorite_only, issue,
             extra_constraints.append("ufe.user_id = %(userId)s")
     # extra_constraints = [extra.decode('UTF-8') + "\n" for extra in extra_constraints]
     if favorite_only and not errors_only and user_id is not None:
-        extra_from += """INNER JOIN (SELECT session_id
-                                    FROM final.user_favorite_sessions
-                                    WHERE user_id = %(userId)s) AS favorite_sessions
-                                    ON (s.session_id=favorite_sessions.session_id)"""
+        extra_from += """INNER JOIN (SELECT 1 AS session_id) AS favorite_sessions
+                                ON (TRUE)"""
     elif not favorite_only and not errors_only and user_id is not None:
         extra_from += """LEFT JOIN (SELECT session_id
                                     FROM final.user_favorite_sessions
