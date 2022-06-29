@@ -209,7 +209,10 @@ export default class DOMManager extends ListWalker<Message> {
       case "set_input_value":
         node = this.nl[ msg.id ]
         if (!node) { logger.error("Node not found", msg); return }
-        if (!(node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement)) { 
+        if (!(node instanceof HTMLInputElement
+            || node instanceof HTMLTextAreaElement
+            || node instanceof HTMLSelectElement)
+        ) {
           logger.error("Trying to set value of non-Input element", msg) 
           return 
         }
